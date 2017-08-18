@@ -1,0 +1,234 @@
+#!/bin/bash
+
+set -eu
+
+#=================================================
+# GENERIC STARTING
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
+
+source _common.sh
+source /usr/share/yunohost/helpers
+
+#=================================================
+# MANAGE FAILURE OF THE SCRIPT
+#=================================================
+
+ynh_clean_setup () {
+# Nettoyage des résidus d'installation non pris en charge par le script remove.
+	if test -n "$PID_TAIL"
+	then
+		SUPPRESS_WARNING kill -s 15 $PID_TAIL	# Arrête l'exécution de tail.
+		sudo rm -f "$tempfile"
+	fi
+	echo ""
+}
+ynh_abort_if_errors	# Active trap pour arrêter le script si une erreur est détectée.
+
+#=================================================
+# RETRIEVE ARGUMENTS FROM THE MANIFEST
+#=================================================
+
+domain=$YNH_APP_ARG_DOMAIN
+is_public=$YNH_APP_ARG_IS_PUBLIC
+path_url=$YNH_APP_ARG_PATH
+admin_name=$YNH_APP_ARG_ADMIN_NAME
+admin_pass=$YNH_APP_ARG_ADMIN_PASS
+admin_email=$YNH_APP_ARG_ADMIN_EMAIL
+app=$YNH_APP_INSTANCE_NAME
+
+#=================================================
+# CHECK IF THE APP CAN BE INSTALLED WITH THIS ARGS
+#=================================================
+
+if sudo yunohost domain list | grep -q $domain	# Vérifie la liste des domaines
+then	# Si le domaine existe dans Yunohost
+	if sudo yunohost app map | grep -q $domain	# Vérifie la liste des apps par domaine
+	then 	# Si une app est installée sur ce domaine.
+		WARNING echo "An app is already installed on the domain $domain. cryptpad needs a whole domain or subdomain to himself."
+	fi
+fi
+
+path_url=$(ynh_normalize_url_path $path_url)	# Check and normalize path
+CHECK_DOMAINPATH	# Vérifie la disponibilité du path et du domaine.
+CHECK_FINALPATH # Vérifie que le dossier de destination n'est pas déjà utilisé.
+
+#=================================================
+# STORE SETTINGS FROM MANIFEST
+#=================================================
+
+ynh_app_setting_set $app domain $domain
+ynh_app_setting_set $app is_public $is_public
+ynh_app_setting_set $app path_url "$path_url"
+ynh_app_setting_set "$app" admin_name "$admin_name"
+ynh_app_setting_set "$app" admin_pass "$admin_pass"
+ynh_app_setting_set "$app" admin_email "$admin_email"
+
+#=================================================
+# STANDARD MODIFICATIONS
+#=================================================
+# FIND AND OPEN A PORT
+#=================================================
+
+port=$(ynh_find_port 8090)	# Cherche un port libre.
+ynh_app_setting_set $app port $port
+
+#=================================================
+# INSTALL DEPENDENCIES
+#=================================================
+
+sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv 0C49F3730359A14518585931BC711F9BA15703C6
+echo "deb http://repo.mongodb.org/apt/debian jessie/mongodb-org/3.4 main" | sudo tee /etc/apt/sources.list.d/mongodb-org-3.4.list
+sudo apt-get update
+sudo apt-get install -yy -qq mongodb-org
+
+#=================================================
+# INSTALL NODEJS
+#=================================================
+version=6.2.0
+ynh_install_nodejs 6.2.0
+
+#=================================================
+# CREATE DEDICATED USER
+#=================================================
+
+ynh_system_user_create $app /home/$app	# Créer un utilisateur système dédié à l'app
+
+#=================================================
+# NODEJS Version
+#=================================================
+
+ynh_use_nodejs
+
+#=================================================
+# SPECIFIC SETUP
+#=================================================
+# HANDLE LOG FILES AND LOGROTATE
+#=================================================
+
+# Créer le dossier de log
+sudo mkdir -p /var/log/$app
+sudo touch /var/log/$app/nodebb.log
+install_log=/var/log/$app/installation.log
+sudo touch $install_log
+sudo chown $app -R /var/log/$app
+sudo chown admin -R $install_log
+
+# Configuration de logrotate
+ynh_use_logrotate
+
+#=================================================
+# DOWNLOAD, CHECK AND UNPACK SOURCE
+#=================================================
+
+final_path=/var/www/$app
+ynh_app_setting_set $app final_path $final_path
+SETUP_SOURCE	# Télécharge la source, décompresse et copie dans $final_path
+sudo chmod 755 $final_path -R
+sudo chown $app: $final_path -R
+
+#=================================================
+# BEGINING OF THE INSTALLATION
+#=================================================
+
+sudo service mongod start
+script_dir="$PWD"
+pushd "$final_path"
+ynh_use_nodejs
+sudo_path npm install -g mocha grunt-cli bower karma-cli
+pushd modules/hublin-easyrtc-connector
+sudo_path npm install
+popd
+pushd meetings
+sudo_path npm install
+popd
+sudo_path npm install >> $install_log 2>&1
+sudo_path npm install mongo
+popd
+
+sudo yunohost firewall allow Both $port
+
+#=================================================
+# CREATE A SQL BDD
+#=================================================
+
+pushd $final_path
+dbname=$app
+dbuser=$app
+dbpass=$(ynh_string_random)
+sudo mongo --shell "$dbname" --eval 'db.createUser( { user: "'${dbuser}'", pwd: "'${dbpass}'", roles: [ "readWrite" ] } );' <<< exit
+sudo mongo --shell "$dbname" --eval 'db.grantRolesToUser("'${dbuser}'",[{ role: "clusterMonitor", db: "admin" }]);' <<< exit
+popd
+
+#=================================================
+# Modify Nginx configuration file and copy it to Nginx conf directory
+#=================================================
+
+ynh_nginx_config
+nginxconf=/etc/nginx/conf.d/$domain.d/$app.conf
+sudo chown root: $nginxconf
+sudo chmod 600 $nginxconf
+ynh_systemd_config
+ynh_replace_string "__NODEJS__" "$nodejs_use_version" "/etc/systemd/system/$app.service"
+ynh_replace_string "__ENV_PATH__" "$PATH" "/etc/systemd/system/$app.service"
+ynh_replace_string "__NODE__" "$nodejs_path" "/etc/systemd/system/$app.service"
+
+#=================================================
+# CONFIGURE SERVER.JS	
+#=================================================
+
+sudo mv ../conf/config.json $final_path/config.json
+sudo sed -i "s@__URL__@$domain@g" $final_path/config/db.json
+sudo sed -i "s@__PORT__@$port@g" $final_path/config/db.json
+sudo sed -i "s@__SECRET__@$secret@g" $final_path/config/db.json
+sudo sed -i "s@dbuser@$dbuser@g" $final_path/config/db.json
+sudo sed -i "s@dbname@$dbname@g" $final_path/config/db.json
+sudo sed -i "s@dbpass@$dbpass@g" $final_path/config/db.json
+
+#=================================================
+# CONFIGURE NODEBB
+#=================================================
+
+pushd $final_path
+sudo chown -R $app: $final_path
+
+popd
+
+sudo chown -R $app:$app $final_path
+
+#=================================================
+# START NodeBB IN BACKGROUND
+#=================================================
+
+cat /etc/systemd/system/$app.service
+sudo systemctl daemon-reload
+sudo systemctl enable "$app".service
+
+#=================================================
+# START ETHERPAD IN BACKGROUND
+#=================================================
+
+sudo systemctl start $app     # Démarre Hublin. Le démarrage est fait le plus tôt possible, car il est très long...
+
+#=================================================
+# ENABLE SERVICE IN ADMIN PANEL
+#=================================================
+
+# Ajoute le service au monitoring de Yunohost.
+sudo yunohost service add $app --log "/var/log/$app/hublin.log"
+
+#=================================================
+# SETUP SSOWAT
+#=================================================
+
+if [ $is_public -eq 1 ];
+then
+  ynh_app_setting_set "$app" unprotected_uris "/"
+fi
+
+#=================================================
+# RELOAD NGINX
+#=================================================
+
+sudo systemctl reload nginx
